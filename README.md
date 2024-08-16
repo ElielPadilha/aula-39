@@ -71,3 +71,134 @@
     </script>
 </body>
 </html>
+
+
+
+
+
+
+from flask import Flask, render_template, request
+from flask_socketio import SocketIO, emit, join_room, leave_room
+from flask_cors import CORS
+import threading
+import time
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'mysecret'
+socketio = SocketIO(app, cors_allowed_origins="*")
+CORS(app)
+
+# Estado do tabuleiro e controle de jogadores
+games = {}
+TURN_TIME_LIMIT = 10  # Tempo limite em segundos para cada turno
+
+@app.route('/')
+def index():
+    return render_template('jogo.html')
+
+@socketio.on('join_game')
+def join_game(data):
+    room = data['room']
+    player_symbol = data['symbol']
+    socket_id = request.sid
+    join_room(room)
+    
+    if room not in games:
+        games[room] = {
+            'board': ['' for _ in range(9)],
+            'current_turn': 'X',
+            'players': {'X': {'sid': None, 'color': 'red'}, 'O': {'sid': None, 'color': 'blue'}},
+            'timer': None
+        }
+        
+    games[room]['players'][player_symbol]['sid'] = socket_id
+    emit('game_update', {
+        'board': games[room]['board'],
+        'current_turn': games[room]['current_turn'],
+        'color': games[room]['players'][player_symbol]['color']
+    }, room=room)
+
+@socketio.on('make_move')
+def handle_move(data):
+    room = data['room']
+    index = int(data['index'])
+    symbol = data['symbol']
+    socket_id = request.sid
+    
+    if room in games:
+        game = games[room]
+        
+        if game['board'][index] == '' and symbol == game['current_turn']:
+            game['board'][index] = symbol
+            emit('update_board', {
+                'index': index,
+                'symbol': symbol,
+                'color': game['players'][symbol]['color']
+            }, room=room)
+            
+            if check_winner(game['board'], symbol):
+                emit('game_over', {'winner': symbol}, room=room)
+                reset_board(room)
+            elif '' not in game['board']:
+                emit('game_over', {'winner': 'Empate'}, room=room)
+                # Reinicia o jogo após um breve atraso
+                socketio.sleep(2)  # Atraso para que os jogadores vejam a mensagem de empate
+                reset_board(room)
+            else:
+                game['current_turn'] = 'O' if symbol == 'X' else 'X'
+                start_turn_timer(room)
+                emit('turn_change', {
+                    'current_turn': game['current_turn'],
+                    'color': game['players'][game['current_turn']]['color']
+                }, room=room)
+        else:
+            emit('error', {'message': 'Invalid move or not your turn'}, room=socket_id)
+    else:
+        emit('error', {'message': 'Invalid game room'}, room=socket_id)
+
+def check_winner(board, symbol):
+    win_conditions = [
+        [0, 1, 2], [3, 4, 5], [6, 7, 8], # Linhas
+        [0, 3, 6], [1, 4, 7], [2, 5, 8], # Colunas
+        [0, 4, 8], [2, 4, 6]             # Diagonais
+    ]
+    return any(all(board[i] == symbol for i in condition) for condition in win_conditions)
+
+def reset_board(room):
+    game = games[room]
+    game['board'] = ['' for _ in range(9)]
+    game['current_turn'] = 'X'
+    game['timer'] = None
+
+def start_turn_timer(room):
+    def timer_thread():
+        time.sleep(TURN_TIME_LIMIT)
+        game = games.get(room)
+        if game and game['current_turn']:
+            emit('time_up', {'message': 'Turn time expired, switching player.'}, room=room)
+            game['current_turn'] = 'O' if game['current_turn'] == 'X' else 'X'
+            emit('turn_change', {
+                'current_turn': game['current_turn'],
+                'color': game['players'][game['current_turn']]['color']
+            }, room=room)
+            start_turn_timer(room)  # Restart the timer for the next turn
+    
+    game = games[room]
+    if game['timer']:
+        game['timer'].cancel()
+    game['timer'] = threading.Timer(TURN_TIME_LIMIT, timer_thread)
+    game['timer'].start()
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    for room, game in games.items():
+        for symbol, player in game['players'].items():
+            if player['sid'] == request.sid:
+                leave_room(room)
+                game['players'][symbol]['sid'] = None
+                if all(player['sid'] is None for player in game['players'].values()):
+                    del games[room]
+                break
+
+if __name__ == '__main__':
+    socketio.run(app, port=8000, debug=True, host="0.0.0.0")
